@@ -70,16 +70,17 @@ def make_reuters_data(data_dir):
     print((len(data), 'and', len(did_to_cat)))
     assert len(data) == len(did_to_cat)
 
-    x = CountVectorizer(dtype=np.float64, max_features=2000).fit_transform(data)
+    x = data
     y = np.asarray(target)
-
-    from sklearn.feature_extraction.text import TfidfTransformer
-    x = TfidfTransformer(norm='l2', sublinear_tf=True).fit_transform(x)
-    x = x[:10000].astype(np.float32)
-    print(x.dtype, x.size)
+    #
+    # from sklearn.feature_extraction.text import TfidfTransformer
+    # x = TfidfTransformer(norm='l2', sublinear_tf=True).fit_transform(x)
+    # x = x[:10000].astype(np.float32)
+    # print(x.dtype, x.size)
+    x = np.array(data[:10000])
     y = y[:10000]
-    x = np.asarray(x.todense()) * np.sqrt(x.shape[1])
-    print('todense succeed')
+    # x = np.asarray(x.todense()) * np.sqrt(x.shape[1])
+    # print('todense succeed')
 
     p = np.random.permutation(x.shape[0])
     x = x[p]
@@ -183,30 +184,50 @@ def load_reuters(data_path='./data/reuters'):
     # has been shuffled
     x = data['data']
     y = data['label']
-    x = x.reshape((x.shape[0], -1)).astype('float64')
-    y = y.reshape((y.size,))
+    # x = x.reshape((x.shape[0], -1)).astype('float64')
+    # y = y.reshape((y.size,))
     print(('REUTERSIDF10K samples', x.shape))
     return x, y
 
 
-def load_retures_keras():
-    from keras.preprocessing.text import Tokenizer
+def load_retures_keras(text=False):
+
     from keras.datasets import reuters
-    max_words = 1000
+    from keras.preprocessing.sequence import pad_sequences
+
+    max_words = 10000
 
     print('Loading data...')
-    (x, y), (_, _) = reuters.load_data(num_words=max_words, test_split=0.)
-    print(len(x), 'train sequences')
+    (x, y), (_, _) = reuters.load_data(num_words=max_words, test_split=0.0)
 
-    num_classes = np.max(y) + 1
-    print(num_classes, 'classes')
+    if not text:
+        num_classes = np.max(y) + 1
+        print(num_classes, 'classes')
+        print('Vectorizing sequence data...')
+        x = pad_sequences(x, maxlen=250)
+        print('x_train shape:', x.shape)
 
-    print('Vectorizing sequence data...')
-    tokenizer = Tokenizer(num_words=max_words)
-    x = tokenizer.sequences_to_matrix(x, mode='binary')
-    print('x_train shape:', x.shape)
+        return x.astype(float), y
+    else:
+        word_index = reuters.get_word_index()
 
-    return x.astype(float), y
+        word_index = {k: (v + 3) for k, v in word_index.items()}
+        word_index["<PAD>"] = 0
+        word_index["<START>"] = 1
+        word_index["<UNK>"] = 2  # unknown
+        word_index["<UNUSED>"] = 3
+
+        reverse_word_index = dict(
+            [(value, key) for (key, value) in word_index.items()])
+
+        def decode_review(text):
+            return ' '.join([reverse_word_index.get(i, '?') for i in text])
+
+        all_sentence = []
+        for sent in x:
+            all_sentence.append(decode_review(sent))
+
+        return np.array(all_sentence),y
 
 
 def load_imdb():

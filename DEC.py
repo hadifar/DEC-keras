@@ -12,16 +12,20 @@ Author:
 
 from time import time
 import numpy as np
-import keras.backend as K
-from keras.engine.topology import Layer, InputSpec
-from keras.layers import Dense, Input
-from keras.models import Model
-from keras.optimizers import SGD
-from keras import callbacks
-from keras.initializers import VarianceScaling
+import tensorflow.keras.backend as K
+from tensorflow.python.keras.optimizers import SGD
+from tensorflow.python.keras.engine import Layer, InputSpec
+from tensorflow.python.keras.models import Model
 from sklearn.cluster import KMeans
 import metrics
+import tensorflow as tf
+import tensorflow_hub as hub
 
+universal = hub.Module("https://tfhub.dev/google/universal-sentence-encoder/2")
+
+
+def UniversalEmbedding(sen):
+  return universal(tf.squeeze(tf.cast(sen, tf.string)))
 
 def autoencoder(dims, act='relu', init='glorot_uniform'):
     """
@@ -33,27 +37,11 @@ def autoencoder(dims, act='relu', init='glorot_uniform'):
     return:
         (ae_model, encoder_model), Model of autoencoder and model of encoder
     """
-    n_stacks = len(dims) - 1
-    # input
-    x = Input(shape=(dims[0],), name='input')
-    h = x
+    x = tf.keras.layers.Input(shape=(1,), dtype=tf.string)
 
-    # internal layers in encoder
-    for i in range(n_stacks-1):
-        h = Dense(dims[i + 1], activation=act, kernel_initializer=init, name='encoder_%d' % i)(h)
+    h = tf.keras.layers.Lambda(UniversalEmbedding, output_shape=(512,))(x)
 
-    # hidden layer
-    h = Dense(dims[-1], kernel_initializer=init, name='encoder_%d' % (n_stacks - 1))(h)  # hidden layer, features are extracted from here
-
-    y = h
-    # internal layers in decoder
-    for i in range(n_stacks-1, 0, -1):
-        y = Dense(dims[i], activation=act, kernel_initializer=init, name='decoder_%d' % i)(y)
-
-    # output
-    y = Dense(dims[0], kernel_initializer=init, name='decoder_0')(y)
-
-    return Model(inputs=x, outputs=y, name='AE'), Model(inputs=x, outputs=h, name='encoder')
+    return Model(inputs=x, outputs=h, name='encoder')
 
 
 class ClusteringLayer(Layer):
@@ -86,9 +74,9 @@ class ClusteringLayer(Layer):
 
     def build(self, input_shape):
         assert len(input_shape) == 2
-        input_dim = input_shape[1]
+        input_dim = input_shape[1].value
         self.input_spec = InputSpec(dtype=K.floatx(), shape=(None, input_dim))
-        self.clusters = self.add_weight((self.n_clusters, input_dim), initializer='glorot_uniform', name='clusters')
+        self.clusters = self.add_weight(shape=(self.n_clusters, input_dim), initializer='glorot_uniform', name='clusters')
         if self.initial_weights is not None:
             self.set_weights(self.initial_weights)
             del self.initial_weights
@@ -102,7 +90,7 @@ class ClusteringLayer(Layer):
         Return:
             q: student's t-distribution, or soft labels for each sample. shape=(n_samples, n_clusters)
         """
-        q = 1.0 / (1.0 + (K.sum(K.square(K.expand_dims(inputs, axis=1) - self.clusters), axis=2) / self.alpha))
+        q = 1.0 / (1.0 + (K.sum(K.square(K.expand_dims(inputs,axis=1) - self.clusters), axis=2) / self.alpha))
         q **= (self.alpha + 1.0) / 2.0
         q = K.transpose(K.transpose(q) / K.sum(q, axis=1))
         return q
@@ -132,47 +120,11 @@ class DEC(object):
 
         self.n_clusters = n_clusters
         self.alpha = alpha
-        self.autoencoder, self.encoder = autoencoder(self.dims, init=init)
+        self.encoder = autoencoder(self.dims, init=init)
 
         # prepare DEC model
         clustering_layer = ClusteringLayer(self.n_clusters, name='clustering')(self.encoder.output)
         self.model = Model(inputs=self.encoder.input, outputs=clustering_layer)
-
-    def pretrain(self, x, y=None, optimizer='adam', epochs=200, batch_size=256, save_dir='results/temp'):
-        print('...Pretraining...')
-        self.autoencoder.compile(optimizer=optimizer, loss='mse')
-
-        csv_logger = callbacks.CSVLogger(save_dir + '/pretrain_log.csv')
-        cb = [csv_logger]
-        if y is not None:
-            class PrintACC(callbacks.Callback):
-                def __init__(self, x, y):
-                    self.x = x
-                    self.y = y
-                    super(PrintACC, self).__init__()
-
-                def on_epoch_end(self, epoch, logs=None):
-                    if int(epochs/10) != 0 and epoch % int(epochs/10) != 0:
-                        return
-                    feature_model = Model(self.model.input,
-                                          self.model.get_layer(
-                                              'encoder_%d' % (int(len(self.model.layers) / 2) - 1)).output)
-                    features = feature_model.predict(self.x)
-                    km = KMeans(n_clusters=len(np.unique(self.y)), n_init=20, n_jobs=4)
-                    y_pred = km.fit_predict(features)
-                    # print()
-                    print(' '*8 + '|==>  acc: %.4f,  nmi: %.4f  <==|'
-                          % (metrics.acc(self.y, y_pred), metrics.nmi(self.y, y_pred)))
-
-            cb.append(PrintACC(x, y))
-
-        # begin pretraining
-        t0 = time()
-        self.autoencoder.fit(x, x, batch_size=batch_size, epochs=epochs, callbacks=cb)
-        print('Pretraining time: %ds' % round(time() - t0))
-        self.autoencoder.save_weights(save_dir + '/ae_weights.h5')
-        print('Pretrained weights are saved to %s/ae_weights.h5' % save_dir)
-        self.pretrained = True
 
     def load_weights(self, weights):  # load weights of DEC model
         self.model.load_weights(weights)
@@ -265,72 +217,28 @@ class DEC(object):
 
 
 if __name__ == "__main__":
-    # setting the hyper parameters
-    import argparse
-
-    parser = argparse.ArgumentParser(description='train',
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--dataset', default='mnist',
-                        choices=['mnist', 'fmnist', 'usps', 'reuters10k', 'stl'])
-    parser.add_argument('--batch_size', default=256, type=int)
-    parser.add_argument('--maxiter', default=2e4, type=int)
-    parser.add_argument('--pretrain_epochs', default=None, type=int)
-    parser.add_argument('--update_interval', default=None, type=int)
-    parser.add_argument('--tol', default=0.001, type=float)
-    parser.add_argument('--ae_weights', default=None)
-    parser.add_argument('--save_dir', default='results')
-    args = parser.parse_args()
-    print(args)
-    import os
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
-
     # load dataset
-    from datasets import load_data
-    x, y = load_data(args.dataset)
+    from datasets import load_retures_keras
+    x, y = load_retures_keras(text=True)
     n_clusters = len(np.unique(y))
 
     init = 'glorot_uniform'
-    pretrain_optimizer = 'adam'
-    # setting parameters
-    if args.dataset == 'mnist' or args.dataset == 'fmnist':
-        update_interval = 140
-        pretrain_epochs = 300
-        init = VarianceScaling(scale=1. / 3., mode='fan_in',
-                               distribution='uniform')  # [-limit, limit], limit=sqrt(1./fan_in)
-        pretrain_optimizer = SGD(lr=1, momentum=0.9)
-    elif args.dataset == 'reuters10k':
-        update_interval = 30
-        pretrain_epochs = 50
-        init = VarianceScaling(scale=1. / 3., mode='fan_in',
-                               distribution='uniform')  # [-limit, limit], limit=sqrt(1./fan_in)
-        pretrain_optimizer = SGD(lr=1, momentum=0.9)
-    elif args.dataset == 'usps':
-        update_interval = 30
-        pretrain_epochs = 50
-    elif args.dataset == 'stl':
-        update_interval = 30
-        pretrain_epochs = 10
-
-    if args.update_interval is not None:
-        update_interval = args.update_interval
-    if args.pretrain_epochs is not None:
-        pretrain_epochs = args.pretrain_epochs
+    update_interval = 30
+    batch_size = 256
+    maxiter = 2e5
+    tol=0.0001
+    save_dir = 'results'
 
     # prepare the DEC model
     dec = DEC(dims=[x.shape[-1], 500, 500, 2000, 10], n_clusters=n_clusters, init=init)
-
-    if args.ae_weights is None:
-        dec.pretrain(x=x, y=y, optimizer=pretrain_optimizer,
-                     epochs=pretrain_epochs, batch_size=args.batch_size,
-                     save_dir=args.save_dir)
-    else:
-        dec.autoencoder.load_weights(args.ae_weights)
-
     dec.model.summary()
     t0 = time()
-    dec.compile(optimizer=SGD(0.01, 0.9), loss='kld')
-    y_pred = dec.fit(x, y=y, tol=args.tol, maxiter=args.maxiter, batch_size=args.batch_size,
-                     update_interval=update_interval, save_dir=args.save_dir)
+    dec.compile('adam', loss='kld')
+
+    with tf.Session() as sess:
+      sess.run(tf.global_variables_initializer())
+      sess.run(tf.tables_initializer())
+      y_pred = dec.fit(x, y=y, tol=tol, maxiter=maxiter, batch_size=batch_size,
+                        update_interval=update_interval, save_dir=save_dir)
     print('acc:', metrics.acc(y, y_pred))
     print('clustering time: ', (time() - t0))
